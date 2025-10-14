@@ -2,72 +2,94 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-import time, os, json, requests, re
-import numpy as np
-import cv2
+import time, json, re
+from kafka import KafkaProducer
+from kafka.errors import NoBrokersAvailable
 
-# Hàm lấy link ảnh từ 1 product element
-def get_detail_image(product):
+# ==================== KẾT NỐI KAFKA ====================
+for _ in range(5):
     try:
-        img_element = product.find_element(By.CSS_SELECTOR, "img")
-        img_url = img_element.get_attribute("src")
+        producer = KafkaProducer(
+            bootstrap_servers=['localhost:9092'],
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+        break
+    except NoBrokersAvailable:
+        print("⚠️ Kafka chưa sẵn sàng, retry sau 5s...")
+        time.sleep(5)
 
-        # Nếu src trống, thử srcset hoặc data-src
-        if not img_url or img_url.startswith(("data:", "blob:")):
-            img_url = img_element.get_attribute("srcset")
-            if img_url:
-                img_url = img_url.split(" ")[0]
-            else:
-                img_url = img_element.get_attribute("data-src")
-
-        if not img_url or img_url.startswith(("data:", "blob:")):
-            print(" Không tìm được link ảnh hợp lệ, bỏ qua.")
-            return None
-
-        return img_url
-    except Exception as e:
-        print(f"Lỗi lấy ảnh: {e}")
-        return None
-
-
-# Khởi tạo driver
+# ==================== KHỞI TẠO DRIVER ====================
 driver = webdriver.Chrome()
-driver.get("https://tiki.vn/thiet-bi-kts-phu-kien-so/c1815")
+detail_driver = webdriver.Chrome()
 
-# Đợi trang load và đóng popup nếu có
+driver.get("https://tiki.vn/thiet-bi-kts-phu-kien-so/c1815")
 time.sleep(5)
+
+# ==================== ĐÓNG POPUP ====================
 try:
-    close_btn = driver.find_element(By.CSS_SELECTOR, "button[class*='close']")
-    close_btn.click()
+    driver.find_element(By.CSS_SELECTOR, "button[class*='close']").click()
     time.sleep(2)
 except:
     pass
 
-# Scroll để load sản phẩm
+# ==================== SCROLL LOAD ====================
 for i in range(3):
     driver.execute_script(f"window.scrollTo(0, {1500 * (i+1)});")
-    time.sleep(2)
+    time.sleep(5)
 
 last_height = driver.execute_script("return document.body.scrollHeight")
 while True:
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(2)
+    time.sleep(5)
     new_height = driver.execute_script("return document.body.scrollHeight")
     if new_height == last_height:
         break
     last_height = new_height
 
-# Tìm sản phẩm
+# ==================== LẤY SẢN PHẨM ====================
 try:
-    products = WebDriverWait(driver, 20).until(
+    products = WebDriverWait(driver, 60).until(
         EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.product-item, div[data-view-id*='product_list_item']"))
     )
 except:
     products = driver.find_elements(By.CSS_SELECTOR, "a.product-item, div[data-view-id*='product_list_item']")
 
-os.makedirs("images", exist_ok=True)
 data = []
 
+# ==================== HÀM LẤY ẢNH ====================
+def get_image_from_list(p):
+    try:
+        img = p.find_element(By.CSS_SELECTOR, "img")
+        url = img.get_attribute("src") or img.get_attribute("srcset") or img.get_attribute("data-src")
+        if url:
+            url = url.split(" ")[0]
+            if url.startswith("//"):
+                url = "https:" + url
+            if not url.startswith(("data:", "blob:")):
+                return url
+        return None
+    except:
+        return None
+
+def get_image_from_detail(link):
+    if not link:
+        return None
+    try:
+        detail_driver.get(link)
+        WebDriverWait(detail_driver, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "img"))
+        )
+        img = detail_driver.find_element(By.CSS_SELECTOR, "img")
+        url = img.get_attribute("src")
+        if url and not url.startswith(("data:", "blob:")):
+            if url.startswith("//"):
+                url = "https:" + url
+            return url
+    except:
+        return None
+    return None
+
+# ==================== VÒNG LẶP CRAWL ====================
 for idx, p in enumerate(products, start=1):
     try:
         title = p.find_element(By.CSS_SELECTOR, "h3, .name, .title").text
@@ -75,9 +97,7 @@ for idx, p in enumerate(products, start=1):
         title = ""
 
     try:
-        link = p.get_attribute("href")
-        if not link:
-            link = p.find_element(By.CSS_SELECTOR, "a").get_attribute("href")
+        link = p.get_attribute("href") or p.find_element(By.CSS_SELECTOR, "a").get_attribute("href")
     except:
         link = ""
 
@@ -91,56 +111,42 @@ for idx, p in enumerate(products, start=1):
     except:
         discount = ""
 
-    # Lấy link ảnh sản phẩm
-    img_url = get_detail_image(p)
+    img_url = get_image_from_list(p)
+    if not img_url:
+        img_url = get_image_from_detail(link)
 
-    img_path = ""
-    if img_url:
-        try:
-            response = requests.get(img_url, timeout=10)
-            if response.status_code == 200:
-                img_array = np.asarray(bytearray(response.content), dtype=np.uint8)
-                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    original_price = None
+    try:
+        price_num = int(re.sub(r"[^\d]", "", price_after))
+        if discount:
+            match = re.search(r"(\d+)%", discount)
+            if match:
+                percent = int(match.group(1))
+                original_price = round(price_num / (1 - percent / 100))
+    except:
+        original_price = None
 
-                if img is not None:
-                    img_path = f"images/product_{idx}.jpg"
-                    cv2.imwrite(img_path, img)
-                    print(f"Đã lưu ảnh {idx}: {img_path}")
-        except Exception as e:
-            print(f"❌ Lỗi tải ảnh {idx}: {e}")
-
-    # Lưu data thô
-    data.append({
+    item = {
         "title": title,
         "link": link,
         "price_after": price_after,
         "discount": discount,
-        "image_file": img_path
-    })
+        "original_price": original_price,
+        "image_url": img_url
+    }
+    data.append(item)
+    producer.send('tiki-topic', value=item)
 
-# Xử lý giá gốc
-cleaned_data = []
-for item in data:
-    try:
-        price_num = int(re.sub(r"[^\d]", "", item["price_after"]))
-        if item["discount"]:
-            match = re.search(r"(\d+)%", item["discount"])
-            if match:
-                percent = int(match.group(1))
-                original_price = round(price_num / (1 - percent/100))
-                item["original_price"] = f"{original_price:,} ₫".replace(",", ".")
-            else:
-                item["original_price"] = None
-        else:
-            item["original_price"] = None
-    except:
-        item["original_price"] = None
-    cleaned_data.append(item)
+    print(f" Gửi sản phẩm {idx}: {title}")
 
+# ==================== LƯU JSON ====================
 with open("tiki_products.json", "w", encoding="utf-8") as f:
-    json.dump(cleaned_data, f, ensure_ascii=False, indent=4)
-
-print(f"Đã lưu dữ liệu {len(cleaned_data)} sản phẩm vào tiki_products.json")
-print(f"Đã tải {sum(1 for item in cleaned_data if item['image_file'])} ảnh vào thư mục images/")
+    json.dump(data, f, ensure_ascii=False, indent=4)
 
 driver.quit()
+detail_driver.quit()
+producer.flush()
+
+print(f"\n Đã crawl {len(data)} sản phẩm.")
+print(f" Dữ liệu lưu vào tiki_products.json")
+print(f" Đã gửi toàn bộ dữ liệu lên Kafka topic tiki-topic")
